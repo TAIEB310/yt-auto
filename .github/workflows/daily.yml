@@ -1,35 +1,109 @@
-name: YT-AUTO Daily Upload
+import os
+import requests
+import google.generativeai as genai
+from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
+from moviepy.editor import ImageSequenceClip, AudioFileClip, concatenate_videoclips
+from gtts import gTTS
 
-on:
-  schedule:
-    - cron: "0 8 * * *"
-  workflow_dispatch:
+# -------------------------- إعداد المفاتيح والبيانات --------------------------
+YT_CLIENT_ID = os.environ['YT_CLIENT_ID']
+YT_CLIENT_SECRET = os.environ['YT_CLIENT_SECRET']
+YT_REFRESH_TOKEN = os.environ['YT_REFRESH_TOKEN']
+PEXELS_API_KEY = os.environ['PEXELS_API_KEY']
+GEMINI_API_KEY = os.environ['GEMINI_API_KEY']
+LANG = os.environ.get('LANG_MODEL', 'arabic')
 
-jobs:
-  upload:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+# ربط جيميني
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-pro')
 
-    steps:
-      - name: 📥 Checkout Repository
-        uses: actions/checkout@v4
+# -------------------------- دالة إنشاء السيناريو --------------------------
+def generate_script(topic):
+    prompt = f"اكتب سيناريو فيديو قصير وجذاب عن الموضوع: {topic}. باللغة {LANG}."
+    response = model.generate_content(prompt)
+    return response.text
 
-      - name: 🐍 Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+# -------------------------- دالة جلب الصور من Pexels --------------------------
+def get_images(query, count=5):
+    url = f"https://api.pexels.com/v1/search?query={query}&per_page={count}"
+    headers = {"Authorization": PEXELS_API_KEY}
+    response = requests.get(url, headers=headers)
+    images = [img['src']['large'] for img in response.json()['photos']]
+    # تحميل الصور محلياً
+    image_paths = []
+    for i, img_url in enumerate(images):
+        img_data = requests.get(img_url).content
+        path = f"image_{i}.jpg"
+        with open(path, 'wb') as f:
+            f.write(img_data)
+        image_paths.append(path)
+    return image_paths
 
-      - name: 📦 Install Dependencies
-        run: pip install -r requirements.txt
+# -------------------------- دالة تحويل النص إلى صوت --------------------------
+def text_to_speech(text, filename="audio.mp3"):
+    tts = gTTS(text=text, lang='ar' if LANG == 'arabic' else 'en')
+    tts.save(filename)
+    return filename
 
-      - name: 🚀 Run YT-AUTO
-        env:
-          GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
-          PEXELS_API_KEY:     ${{ secrets.PEXELS_API_KEY }}
-          TELEGRAM_TOKEN:     ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          YT_CLIENT_ID:       ${{ secrets.YT_CLIENT_ID }}
-          YT_CLIENT_SECRET:   ${{ secrets.YT_CLIENT_SECRET }}
-          YT_REFRESH_TOKEN:   ${{ secrets.YT_REFRESH_TOKEN }}
-          LANG_MODE:          ${{ secrets.LANG_MODE }}
-        run: python main.py
+# -------------------------- دالة إنشاء الفيديو --------------------------
+def create_video(images, audio_path, output_filename="output.mp4"):
+    audio = AudioFileClip(audio_path)
+    duration = audio.duration
+    image_clips = [ImageSequenceClip([img], duration=duration/len(images)) for img in images]
+    final_clip = concatenate_videoclips(image_clips)
+    final_clip = final_clip.set_audio(audio)
+    final_clip.write_videofile(output_filename, fps=24)
+    return output_filename
+
+# -------------------------- دالة النشر على يوتيوب --------------------------
+def publish_to_youtube(video_path, title, description):
+    credentials = Credentials(
+        None,
+        refresh_token=YT_REFRESH_TOKEN,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=YT_CLIENT_ID,
+        client_secret=YT_CLIENT_SECRET
+    )
+    youtube = build('youtube', 'v3', credentials=credentials)
+    
+    body = {
+        'snippet': {
+            'title': title,
+            'description': description,
+            'tags': ['تلقائي', 'ذكاء اصطناعي', 'محتوى'],
+            'categoryId': '22'
+        },
+        'status': {
+            'privacyStatus': 'public'
+        }
+    }
+    
+    media = youtube.videos().insert(
+        part='snippet,status',
+        body=body,
+        media_body=video_path
+    )
+    response = media.execute()
+    print(f"تم النشر بنجاح! رابط الفيديو: https://www.youtube.com/watch?v={response['id']}")
+
+# -------------------------- التشغيل الرئيسي --------------------------
+if __name__ == "__main__":
+    topic = "كيف تصبح غنياً في 5 خطوات"  # يمكنك تغيير الموضوع هنا
+    
+    print("1. جاري إنشاء السيناريو...")
+    script = generate_script(topic)
+    
+    print("2. جاري جلب الصور...")
+    images = get_images(topic)
+    
+    print("3. جاري تحويل النص إلى صوت...")
+    audio_file = text_to_speech(script)
+    
+    print("4. جاري تجميع الفيديو...")
+    video_file = create_video(images, audio_file)
+    
+    print("5. جاري النشر على يوتيوب...")
+    publish_to_youtube(video_file, topic, script)
+    
+    print("✅ اكتملت العملية بنجاح!")
